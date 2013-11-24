@@ -1,0 +1,54 @@
+{
+   "abstract" : "Specialized HTTP client",
+   "author" : [
+      "Kang-min Liu & Borislav Nikolov"
+   ],
+   "dynamic_config" : "0",
+   "generated_by" : "Module::Install version 1.06, CPAN::Meta::Converter version 2.120921",
+   "license" : [
+      "mit"
+   ],
+   "meta-spec" : {
+      "url" : "http://search.cpan.org/perldoc?CPAN::Meta::Spec",
+      "version" : "2"
+   },
+   "name" : "Hijk",
+   "no_index" : {
+      "directory" : [
+         "examples",
+         "inc",
+         "t"
+      ]
+   },
+   "prereqs" : {
+      "build" : {
+         "requires" : {
+            "ExtUtils::MakeMaker" : "6.59"
+         }
+      },
+      "configure" : {
+         "requires" : {
+            "CPAN::Meta" : "0",
+            "ExtUtils::MakeMaker" : "6.59"
+         }
+      },
+      "runtime" : {
+         "requires" : {
+            "perl" : "v5.8.0"
+         }
+      },
+      "test" : {
+         "requires" : {
+            "Test::More" : "0"
+         }
+      }
+   },
+   "release_status" : "stable",
+   "resources" : {
+      "license" : [
+         "http://opensource.org/licenses/mit-license.php"
+      ]
+   },
+   "version" : "0.02",
+   "x_module_name" : "Hijk"
+}
