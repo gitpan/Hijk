@@ -4,7 +4,7 @@ use strict;
 use warnings;
 use POSIX;
 use Socket qw(PF_INET SOCK_STREAM sockaddr_in inet_aton $CRLF);
-our $VERSION = "0.02";
+our $VERSION = "0.03";
 
 eval {
     require Hijk::HTTP::XS;
@@ -94,9 +94,10 @@ sub request {
     die "send error ($r) $!"
         if syswrite($soc,$r) != length($r);
 
-    my ($status,$body) = fetch(fileno($soc));
+    my ($status,$body,$head) = fetch(fileno($soc));
     return {
         status => $status,
+        head => $head,
         body => $body
     };
 }
@@ -191,6 +192,8 @@ key-value pairs.
 
 =item body => :Str
 
+=item head => :HashRef
+
 =back
 
 For example, to send request to C<http://example.com/flower?color=red>, use the
@@ -211,6 +214,9 @@ C<query_string>.
 All values are assumed to be valid. Hijk simply passthru the values without
 validating the content. It is possible that it constructs invalid HTTP Messages.
 Users should keep this in mind when using Hijk.
+
+Noticed that the C<head> in the response is a HashRef rather then an ArrayRef.
+This makes it easier to retrieve specific header fields.
 
 =head1 AUTHORS
 
