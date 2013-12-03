@@ -2,63 +2,70 @@ package Hijk;
 use 5.008;
 use strict;
 use warnings;
-use POSIX;
+use POSIX qw(EINPROGRESS);
 use Socket qw(PF_INET SOCK_STREAM sockaddr_in inet_aton $CRLF);
-our $VERSION = "0.03";
+use Fcntl qw(F_GETFL F_SETFL O_NONBLOCK);
+our $VERSION = "0.04";
+my $SocketCache = {};
 
 eval {
+    local $SIG{__DIE__} = sub { *fetch = \&Hijk::pp_fetch; };
     require Hijk::HTTP::XS;
     *fetch = \&Hijk::HTTP::XS::fetch;
     1;
-} or do {
-    *fetch = \&Hijk::pp_fetch;
 };
-
-my $SocketCache = {};
 
 sub pp_fetch {
     my $fd = shift || die "need file descriptor";
+    my $timeout_ms = shift || 0;
+
     my ($head,$neck,$body,$buf) = ("", "${CRLF}${CRLF}");
     my ($block_size, $decapitated, $status_code) = (10240);
     my $header = {};
+    vec(my $rin = '', $fd, 1) = 1;
     do {
-        # it blocks until receives at least $block_size
-        my $nbytes = POSIX::read($fd, $buf, $block_size);
-        if (defined($nbytes)) {
-            if ($decapitated) {
-                $body .= $buf;
-                $block_size -= $nbytes;
-            }
-            else {
-                my $neck_pos = index($buf, $neck);
-                if ($neck_pos > 0) {
-                    $decapitated = 1;
-                    $head .= substr($buf, 0, $neck_pos);
-                    $status_code = substr($head, 9, 3);
-                    substr($head, 0, index($head, "${CRLF}")+length($CRLF), "");
-
-                    for (split /${CRLF}/o, $head) {
-                        my ($key, $value) = split /: /, $_, 2;
-                        $header->{$key} = $value;
-                    }
-
-                    if ($header->{'Content-Length'}) {
-                        $body = substr($buf, $neck_pos + length($neck));
-                        $block_size = $header->{'Content-Length'} - length($body);
-                    }
-                    else {
-                        $block_size = 0;
-                        $body = "";
-                    }
-                }
-                else {
-                    $head = $buf;
-                }
-            }
+        if ($timeout_ms) {
+            my $nfound = select($rin, undef, undef, $timeout_ms / 1000);
+            die "select(2) error, errno = $!" if $nfound == -1;
+            die "READ TIMEOUT" unless $nfound == 1;
         }
-        else {
+
+        my $nbytes = POSIX::read($fd, $buf, $block_size);
+        unless (defined($nbytes)) {
             die "Failed to read http " .( $decapitated ? "body": "head" ). " from socket";
         }
+
+        if ($decapitated) {
+            $body .= $buf;
+            $block_size -= $nbytes;
+        }
+        else {
+            my $neck_pos = index($buf, $neck);
+            if ($neck_pos > 0) {
+                $decapitated = 1;
+                $head .= substr($buf, 0, $neck_pos);
+                $status_code = substr($head, 9, 3);
+                substr($head, 0, index($head, "${CRLF}")+length($CRLF), "");
+
+                for (split /${CRLF}/o, $head) {
+                    my ($key, $value) = split /: /, $_, 2;
+                    $header->{$key} = $value;
+                }
+
+                if ($header->{'Content-Length'}) {
+                    $body = substr($buf, $neck_pos + length($neck));
+                    $block_size = $header->{'Content-Length'} - length($body);
+                }
+                else {
+                    $block_size = 0;
+                    $body = "";
+                }
+            }
+            else {
+                $head = $buf;
+            }
+        }
+
     } while( !$decapitated || $block_size > 0 );
 
     return ($status_code, $body, $header);
@@ -86,15 +93,32 @@ sub request {
     my $args = $_[0];
     my $soc = $SocketCache->{"$args->{host};$args->{port};$$"} ||= do {
         my $soc;
+        my $addr = sockaddr_in($args->{port}, inet_aton($args->{host}));
         socket($soc, PF_INET, SOCK_STREAM, getprotobyname('tcp')) || die $!;
-        connect($soc, sockaddr_in($args->{port}, inet_aton($args->{host}))) || die $!;
+        my $flags = fcntl($soc, F_GETFL, 0) or die $!;
+        if ($args->{timeout}) {
+            fcntl($soc, F_SETFL, $flags | O_NONBLOCK) or die $!;
+        }
+        connect($soc, $addr) or do {
+            if ($! == EINPROGRESS) {
+                vec(my $w = '', fileno($soc), 1) = 1;
+                my $n = select(undef, $w, undef, $args->{timeout}) or  die "CONNECT TIMEOUT";
+                die "select(2) error, errno = $!" if $n < 0;
+            }
+            else {
+                die "connect(2) error, errno = $!";
+            }
+        };
+        if ($args->{timeout}) {
+            fcntl($soc, F_SETFL, $flags) or die $!;
+        }
         $soc;
     };
     my $r = build_http_message($args);
     die "send error ($r) $!"
         if syswrite($soc,$r) != length($r);
 
-    my ($status,$body,$head) = fetch(fileno($soc));
+    my ($status,$body,$head) = fetch(fileno($soc), ($args->{timeout}||0)*1000);
     return {
         status => $status,
         head => $head,
@@ -153,6 +177,8 @@ with default values listed below
 
 =item port => ...
 
+=item timeout => 0
+
 =item method => "GET"
 
 =item path => "/"
@@ -182,6 +208,11 @@ the order of headers can be maintained. For example:
     X-Requested-With: Hijk
 
 Again, there are no extra character-escaping filter within Hijk.
+
+The value of C<timeout> is in seconds, and is used as the time limit for both
+connecting to the host, and reading from the socket. The default value C<0>
+means that there is no timeout limit. If the host is really unreachable, it will
+reach the system TCP timeout limit then dies.
 
 The return vaue is a HashRef representing a response. It contains the following
 key-value pairs.

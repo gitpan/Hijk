@@ -4,6 +4,8 @@ author:
   - 'Kang-min Liu & Borislav Nikolov'
 build_requires:
   ExtUtils::MakeMaker: 6.59
+  Net::Ping: 0
+  Plack: 0
   Test::More: 0
 configure_requires:
   CPAN::Meta: 0
@@ -24,5 +26,5 @@ requires:
   perl: v5.8.0
 resources:
   license: http://opensource.org/licenses/mit-license.php
-version: 0.03
+version: 0.04
 x_module_name: Hijk
