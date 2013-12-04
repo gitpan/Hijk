@@ -1,6 +1,7 @@
 Changes
 cpanfile
 examples/bench-elasticsearch.pl
+examples/dumbbench-thisurl.pl
 examples/hijkurl
 inc/Module/CPANfile.pm
 inc/Module/CPANfile/Environment.pm

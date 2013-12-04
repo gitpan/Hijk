@@ -3,13 +3,13 @@ abstract: 'Specialized HTTP client'
 author:
   - 'Kang-min Liu & Borislav Nikolov'
 build_requires:
-  ExtUtils::MakeMaker: 6.59
+  ExtUtils::MakeMaker: 6.36
   Net::Ping: 0
   Plack: 0
   Test::More: 0
 configure_requires:
   CPAN::Meta: 0
-  ExtUtils::MakeMaker: 6.59
+  ExtUtils::MakeMaker: 6.36
 dynamic_config: 0
 generated_by: 'Module::Install version 1.06, CPAN::Meta::Converter version 2.120921'
 license: mit
@@ -22,9 +22,7 @@ no_index:
     - examples
     - inc
     - t
-requires:
-  perl: v5.8.0
 resources:
   license: http://opensource.org/licenses/mit-license.php
-version: 0.04
+version: 0.05
 x_module_name: Hijk

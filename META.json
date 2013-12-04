@@ -23,18 +23,13 @@
    "prereqs" : {
       "build" : {
          "requires" : {
-            "ExtUtils::MakeMaker" : "6.59"
+            "ExtUtils::MakeMaker" : "6.36"
          }
       },
       "configure" : {
          "requires" : {
             "CPAN::Meta" : "0",
-            "ExtUtils::MakeMaker" : "6.59"
-         }
-      },
-      "runtime" : {
-         "requires" : {
-            "perl" : "v5.8.0"
+            "ExtUtils::MakeMaker" : "6.36"
          }
       },
       "test" : {
@@ -51,6 +46,6 @@
          "http://opensource.org/licenses/mit-license.php"
       ]
    },
-   "version" : "0.04",
+   "version" : "0.05",
    "x_module_name" : "Hijk"
 }
