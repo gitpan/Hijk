@@ -11,6 +11,7 @@ unless ($ENV{TEST_LIVE}) {
 }
 
 my %args = (
+    ($ENV{HIJK_XS} ? (fetch => do { require Hijk::HTTP::XS; \&Hijk::HTTP::XS::fetch; }) : ()),
     host => "google.com",
     port => "80",
     method => "GET",
@@ -28,5 +29,10 @@ subtest "with 1s timeout limit, do not expect an exception." => sub {
     } 'google.com send back something within 10s';
 };
 
+subtest "without timeout, do not expect an exception." => sub {
+    lives_ok {
+        my $res = Hijk::request({%args, timeout => 0});
+    } 'google.com send back something without timeout';
+};
 
 done_testing;

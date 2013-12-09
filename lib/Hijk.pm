@@ -4,19 +4,13 @@ use warnings;
 use POSIX qw(EINPROGRESS);
 use Socket qw(PF_INET SOCK_STREAM sockaddr_in inet_aton $CRLF);
 use Fcntl qw(F_GETFL F_SETFL O_NONBLOCK);
-our $VERSION = "0.05";
+our $VERSION = "0.06";
 my $SocketCache = {};
-
-eval {
-    local $SIG{__DIE__} = sub { *fetch = \&Hijk::pp_fetch; };
-    require Hijk::HTTP::XS;
-    *fetch = \&Hijk::HTTP::XS::fetch;
-    1;
-};
 
 sub pp_fetch {
     my $fd = shift || die "need file descriptor";
-    my ($timeout,$block_size,$header,$head,$body,$buf,$decapitated,$status_code,$nfound,$nbytes) = (shift,10240,{},"");
+    my ($timeout,$block_size,$header,$head,$body,$buf,$decapitated,$nfound,$nbytes) = (shift,10240,{},"");
+    my $status_code = 0;
     $timeout /= 1000 if defined $timeout;
     vec(my $rin = '', $fd, 1) = 1;
     do {
@@ -111,11 +105,16 @@ sub request {
         $soc;
     };
     my $r = build_http_message($args);
+    my $rc = syswrite($soc,$r);
     die "send error ($r) $!"
-        if syswrite($soc,$r) != length($r);
+        if !$rc || $rc != length($r);
 
-    my ($status,$body,$head) = fetch(fileno($soc), $args->{timeout} && ($args->{timeout}*1000));
-    if ($head->{Connection} && $head->{Connection} eq 'close') {
+    # Maybe instead we should just allow you to pass in
+    # "fetch => \&Hijk::HTTP::XS::fetch".
+    my $fetch = $args->{fetch} || \&Hijk::pp_fetch;
+    my ($status,$body,$head) = $fetch->(fileno($soc), (($args->{timeout} || 0) * 1000));
+
+    if ($status == 0 || ($head->{Connection} && $head->{Connection} eq 'close')) {
         shutdown(delete $SocketCache->{"$args->{host};$args->{port};$$"}, 2); # or die "shutdown(2) error, errno = $!";
     }
     return {
@@ -137,16 +136,38 @@ Hijk - Specialized HTTP client
 
 =head1 SYNOPSIS
 
+A simple GET request:
+
+    use Hijk;
     my $res = Hijk::request({
-        host => "example.com",
-        port => "80",
-        path => "/flower",
+        method       => "GET",
+        host         => "example.com",
+        port         => "80",
+        path         => "/flower",
         query_string => "color=red"
     });
 
-    die unless ($res->{status} == "200"); {
+    die unless ($res->{status} == "200");
 
     say $res->{body};
+
+A POST request, you have to manually set the appropriate headers, URI
+escape your values etc.
+
+    use Hijk;
+    use URI::Escape qw(uri_escape);
+
+    my $res = Hijk::request({
+        method       => "POST",
+        host         => "example.com",
+        port         => "80",
+        path         => "/new",
+        head         => [ "Content-Type" => "application/x-www-form-urlencoded" ],
+        query_string => "type=flower&bucket=the%20one%20out%20back",
+        body         => "description=" . uri_escape("Another flower, let's hope it's exciting"),
+    });
+
+    die unless ($res->{status} == "200");
 
 =head1 DESCRIPTION
 
@@ -187,6 +208,12 @@ with default values listed below
 =item head => []
 
 =item body => ""
+
+=item fetch => ...
+
+An optional subroutine reference we'll use to do to the fetching. Load
+L<Hijk::HTTP::XS> and set it to C<\&Hijk::HTTP::XS::fetch> to use an
+XS fetcher.
 
 =back
 
@@ -247,6 +274,10 @@ Users should keep this in mind when using Hijk.
 
 Noticed that the C<head> in the response is a HashRef rather then an ArrayRef.
 This makes it easier to retrieve specific header fields.
+
+We currently don't support returning a body without a Content-Length
+header, bodies B<MUST> have an accompanying Content-Length or we won't
+pick them up.
 
 =head1 AUTHORS
 

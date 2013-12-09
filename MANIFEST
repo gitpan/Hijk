@@ -1,6 +1,7 @@
 Changes
 cpanfile
 examples/bench-elasticsearch.pl
+examples/bench-nginx.pl
 examples/dumbbench-thisurl.pl
 examples/hijkurl
 inc/Module/CPANfile.pm
@@ -26,4 +27,5 @@ t/connect-timeout.t
 t/live-elasticsearch.t
 t/live-google.t
 t/live-plack.t
+t/parse-http-connection-close-message.t
 t/parse-http-message.t

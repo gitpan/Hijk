@@ -25,11 +25,22 @@ pass "ip generated = $ip";
 
 throws_ok {
     my $res = Hijk::request({
+        ($ENV{HIJK_XS} ? (fetch => do { require Hijk::HTTP::XS; \&Hijk::HTTP::XS::fetch; }) : ()),
         host => $ip,
         port => 80,
         timeout => 1            # seconds
     });
 } qr/CONNECT\s*TIMEOUT/i;
+
+lives_ok {
+    my $res = Hijk::request({
+        ($ENV{HIJK_XS} ? (fetch => do { require Hijk::HTTP::XS; \&Hijk::HTTP::XS::fetch; }) : ()),
+        host => 'google.com',
+        port => 80,
+        timeout => 0
+    });
+};
+
 
 done_testing;
 
