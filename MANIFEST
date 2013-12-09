@@ -23,7 +23,7 @@ META.json
 META.yml
 t/bin/it-takes-time.psgi
 t/build_http_message.t
-t/connect-timeout.t
+t/live-connect-timeout.t
 t/live-elasticsearch.t
 t/live-google.t
 t/live-plack.t
