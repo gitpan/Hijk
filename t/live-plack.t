@@ -4,7 +4,6 @@ use strict;
 use FindBin;
 
 use Hijk;
-require Hijk::HTTP::XS if $ENV{HIJK_XS};
 
 use Test::More;
 use Test::Exception;
@@ -34,29 +33,17 @@ my %args = (
     method => "GET",
 );
 
-subtest "expect timeout" => sub {
-    if ($ENV{HIJK_XS}) {
-        eval {
-            my $res = Hijk::request({%args, timeout => 1});
-            TODO: {
-                local $TODO = "The XS library doesn't throw an exception here";
-                fail($TODO);
-            }
-            1;
-        } or do {
-            my $error = $@ || "Zombie Error";
-            fail("We shouldn't pass this, well, we should, but let's fix the test too");
-        };
-    } else {
-        throws_ok {
-            my $res = Hijk::request({%args, timeout => 1});
-        } qr/timeout/i;
-    }
+subtest "expect read timeout" => sub {
+    lives_ok {
+        my $res = Hijk::request({%args, timeout => 1});
+        ok exists $res->{error}, '$res->{error} should exist becasue a read timeout is expected.';
+        is $res->{error}, Hijk::Error::READ_TIMEOUT, '$res->{error} == Hijk::Error::READ_TIMEOUT';
+    };
 };
 
 subtest "do not expect timeout" => sub {
     lives_ok {
-        my $res = Hijk::request({%args, timeout => 10_000});
+        my $res = Hijk::request({%args, timeout => 10});
     } 'local plack send back something within 10s';
 };
 

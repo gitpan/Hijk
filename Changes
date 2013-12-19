@@ -1,3 +1,20 @@
+0.10: # 2013-12-19T16:50:00+0100
+- We can now talk HTTP/1.0 an addition to HTTP/1.1, have a way to
+  disable the socket cache, and can specify connect and read timeouts
+  independently.
+- Fix a really nasty bug with mixings up requests after encountering a
+  timeout. See
+  http://lists.unbit.it/pipermail/uwsgi/2013-December/006802.html for
+  details.
+- Remove spurious requirenment on perl v5.14.2
+- First stab at https://github.com/gugod/Hijk/issues/3 we'll now
+  return an error key in the response with
+  Hijk::Error::{CONNECT_TIMEOUT,READ_TIMEOUT} instead of dying.
+- Nuked the Hijk::HTTP::XS support from the repo, we've decided it was
+  too complex for its own good.
+- Add support for an on_connect callback for seeing how long the
+  connect/reads take.
+
 0.09: # 2013-12-13T07:38:25+0100
 - KEEP CALM AND REMOVE FETCH OPTION
 - Hijk::request will use XS parser only if Hijk::HTTP::XS is loaded
