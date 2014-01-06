@@ -25,5 +25,5 @@ no_index:
     - t
 resources:
   license: http://opensource.org/licenses/mit-license.php
-version: 0.10
+version: 0.11
 x_module_name: Hijk

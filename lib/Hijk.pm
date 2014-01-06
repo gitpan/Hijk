@@ -4,7 +4,7 @@ use warnings;
 use POSIX qw(EINPROGRESS);
 use Socket qw(PF_INET SOCK_STREAM sockaddr_in inet_aton $CRLF);
 use Fcntl qw(F_GETFL F_SETFL O_NONBLOCK);
-our $VERSION = "0.10";
+our $VERSION = "0.11";
 
 sub Hijk::Error::CONNECT_TIMEOUT () { 1 << 0 } # 1
 sub Hijk::Error::READ_TIMEOUT    () { 1 << 1 } # 2
@@ -12,16 +12,15 @@ sub Hijk::Error::TIMEOUT         () { Hijk::Error::READ_TIMEOUT() | Hijk::Error:
 # sub Hijk::Error::WHATEVER      () { 1 << 2 } # 4
 
 sub fetch {
-    my $fd = shift || die "need file descriptor";
-    my ($read_timeout,$block_size,$header,$head,$body,$buf,$decapitated,$nfound,$nbytes) = (shift,10240,{},"");
+    my ($fd, $read_timeout,$block_size,$header,$head) = (shift,shift,10240,{},"");
+    my ($body,$buf,$decapitated,$nfound,$nbytes,$proto);
     my $status_code = 0;
-    $read_timeout /= 1000 if defined $read_timeout;
     vec(my $rin = '', $fd, 1) = 1;
     do {
         if ($read_timeout) {
             $nfound = select($rin, undef, undef, $read_timeout);
             die "select(2) error, errno = $!" if $nfound == -1;
-            return (0,undef,undef, Hijk::Error::READ_TIMEOUT) unless $nfound == 1;
+            return (undef,0,undef,undef, Hijk::Error::READ_TIMEOUT) unless $nfound == 1;
         }
 
         $nbytes = POSIX::read($fd, $buf, $block_size);
@@ -37,10 +36,13 @@ sub fetch {
             $block_size -= $nbytes;
         }
         else {
-            my $neck_pos = index($buf, "${CRLF}${CRLF}");
+            $head .= $buf;
+            my $neck_pos = index($head, "${CRLF}${CRLF}");
             if ($neck_pos > 0) {
                 $decapitated = 1;
-                $head .= substr($buf, 0, $neck_pos);
+                $body = substr($head, $neck_pos+4);
+                $head = substr($head, 0, $neck_pos);
+                $proto = substr($head, 0, 8);
                 $status_code = substr($head, 9, 3);
                 substr($head, 0, index($head, $CRLF) + 2, ""); # 2 = length($CRLF)
 
@@ -50,22 +52,17 @@ sub fetch {
                 }
 
                 if ($header->{'Content-Length'}) {
-                    $body = substr($buf, $neck_pos + 4); # 4 = length("${CRLF}${CRLF}")
                     $block_size = $header->{'Content-Length'} - length($body);
                 }
                 else {
                     $block_size = 0;
-                    $body = "";
                 }
-            }
-            else {
-                $head = $buf;
             }
         }
 
     } while( !$decapitated || $block_size > 0 );
 
-    return ($status_code, $body, $header);
+    return ($proto, $status_code, $body, $header);
 }
 
 sub construct_socket {
@@ -83,7 +80,7 @@ sub construct_socket {
             vec(my $w = '', fileno($soc), 1) = 1;
             my $n = select(undef, $w, undef, $connect_timeout);
             unless ($n) {
-                return (undef, { error => Hijk::Error::CONNECT_TIMEOUT });
+                return (undef, Hijk::Error::CONNECT_TIMEOUT);
             }
 
             die "select(2) error, errno = $!" if $n < 0;
@@ -127,14 +124,17 @@ sub request {
     # Ditto for providing a default socket cache, allow for setting it
     # to "socket_cache => undef" to disable the cache.
     $args->{socket_cache} = $SOCKET_CACHE unless exists $args->{socket_cache};
-    my $cache_key; $cache_key = "$args->{host};$args->{port};$$" if exists $args->{socket_cache};
+
+    # Use $; so we can use the $socket_cache->{$$, $host, $port}
+    # idiom to access the cache.
+    my $cache_key; $cache_key = join($;, $$, @$args{qw(host port)}) if defined $args->{socket_cache};
 
     my $soc;
     if (defined $cache_key and exists $args->{socket_cache}->{$cache_key}) {
         $soc = $args->{socket_cache}->{$cache_key};
     } else {
         ($soc, my $error) = construct_socket(@$args{qw(host port connect_timeout)});
-        return $error if defined $error; # To maybe return the CONNECT_TIMEOUT
+        return {error => $error} if defined $error; # To maybe return the CONNECT_TIMEOUT
         $args->{socket_cache}->{$cache_key} = $soc if defined $cache_key;
         $args->{on_connect}->() if exists $args->{on_connect};
     }
@@ -147,8 +147,8 @@ sub request {
         die "send error ($r) $!";
     }
 
-    my ($status,$body,$head,$error) = eval {
-        fetch(fileno($soc), (($args->{read_timeout} || 0) * 1000));
+    my ($proto,$status,$body,$head,$error) = eval {
+        fetch(fileno($soc), $args->{read_timeout});
     } or do {
         my $err = $@ || "zombie error";
         delete $args->{socket_cache}->{$cache_key} if defined $cache_key;
@@ -156,11 +156,20 @@ sub request {
         die $err;
     };
 
-    if ($status == 0 || ($head->{Connection} && $head->{Connection} eq 'close')) {
+    if ($status == 0
+        # We always close connections for 1.0 because some servers LIE
+        # and say that they're 1.0 but don't close the connection on
+        # us! An example of this. Test::HTTP::Server (used by the
+        # ShardedKV::Storage::Rest tests) is an example of such a
+        # server. In either case we can't cache a connection for a 1.0
+        # server anyway, so BEGONE!
+        or (defined $proto and $proto eq 'HTTP/1.0')
+        or ($head->{Connection} && $head->{Connection} eq 'close')) {
         delete $args->{socket_cache}->{$cache_key} if defined $cache_key;
         shutdown($soc, 2);
     }
     return {
+        proto => $proto,
         status => $status,
         head => $head,
         body => $body,
@@ -219,21 +228,21 @@ escape your values etc.
 
 =head1 DESCRIPTION
 
-Hijk is a specialized HTTP Client that does nothing but transporting the
+Hijk is a specialized HTTP Client that does nothing but transport the
 response body back. It does not feature as a "user agent", but as a dumb
-client. It is suitble for connecting to data servers transporting via HTTP
+client. It is suitable for connecting to data servers transporting via HTTP
 rather then web servers.
 
 Most of HTTP features like proxy, redirect, Transfer-Encoding, or SSL are not
 supported at all. For those requirements we already have many good HTTP clients
 like L<HTTP::Tiny>, L<Furl> or L<LWP::UserAgent>.
 
-=head1 FUNCTIONS
 
-=head2 Hijk::request( $args :HashRef ) :HashRef
+=head1 FUNCTION: Hijk::request( $args :HashRef ) :HashRef
 
-This is the only function to be used. It is not exported to its caller namespace
-at all. It takes a request arguments in HashRef and returns the response in HashRef.
+C<Hijk::request> is the only function to be used. It is not exported to its
+caller namespace at all. It takes a request arguments in HashRef and returns the
+response in HashRef.
 
 The C<$args> request arg should be a HashRef containing key-value pairs from the
 following list. The value for C<host> and C<port> are mandatory and others are
@@ -252,7 +261,7 @@ optional with default values listed below
     socket_cache    => {}, # (undef to disable, or \my %your_socket_cache)
     on_connect      => undef, # (or sub { ... })
 
-Too keep the implementation minimal, Hijk does not take full URL string as
+To keep the implementation minimal, Hijk does not take full URL string as
 input. User who need to parse URL string could use L<URI> modules.
 
 The value of C<head> is an ArrayRef of key-value pairs instead of HashRef, this way
@@ -268,7 +277,7 @@ the order of headers can be maintained. For example:
     Content-Type: application/json
     X-Requested-With: Hijk
 
-Again, there are no extra character-escaping filter within Hijk.
+Again, there are no extra character-escaping filters within Hijk.
 
 The value of C<connect_timeout> or C<read_timeout> is in seconds, and
 is used as the time limit for connecting to the host, and reading from
@@ -283,7 +292,7 @@ The optional C<on_connect> callback is intended to be used for you to
 figure out from production traffic what you should set the
 C<connect_timeout>. I.e. you can start a timer when you call
 C<Hijk::request()> that you end when C<on_connect> is called, that's
-how long is took us to get a connection, if you start another timer in
+how long it took us to get a connection. If you start another timer in
 that callback that you end when C<Hijk::request()> returns to you
 that'll give you how long it took to send/receive data after we
 constructed the socket, i.e. it'll help you to tweak your
@@ -299,24 +308,19 @@ and keeping open connections down and reducing complexity is more
 important, in those cases you can use C<HTTP/1.0>.
 
 By default we will provide a C<socket_cache> for you which is a global
-singleton that we maintain keyed on host/port/pid. Alternatively you
-can pass in C<socket_cache> hash of your own which we'll use as the
-cache. To completely disable the cache pass in C<undef>.
+singleton that we maintain keyed on C<join($;, $$, $host, $port)>.
+Alternatively you can pass in C<socket_cache> hash of your own which
+we'll use as the cache. To completely disable the cache pass in
+C<undef>.
 
 The return vaue is a HashRef representing a response. It contains the following
 key-value pairs.
 
-=over 4
-
-=item status => :StatusCode
-
-=item body => :Str
-
-=item head => :HashRef
-
-=item error => :Int
-
-=back
+    proto  => :Str
+    status => :StatusCode
+    body   => :Str
+    head   => :HashRef
+    error  => :Int
 
 For example, to send request to C<http://example.com/flower?color=red>, use the
 following code:
@@ -333,16 +337,18 @@ Notice that you do not need to put the leading C<"?"> character in the
 C<query_string>. You do, however, need to propery C<uri_escape> the content of
 C<query_string>.
 
-All values are assumed to be valid. Hijk simply passthru the values without
+All values are assumed to be valid. Hijk simply passes the values through without
 validating the content. It is possible that it constructs invalid HTTP Messages.
 Users should keep this in mind when using Hijk.
 
 Noticed that the C<head> in the response is a HashRef rather then an ArrayRef.
 This makes it easier to retrieve specific header fields.
 
-We currently don't support returning a body without a Content-Length
-header, bodies B<MUST> have an accompanying Content-Length or we won't
-pick them up.
+We currently don't support server that does not return a http body without a
+Content-Length header, bodies B<MUST> have an accompanying Content-Length or we
+won't pick them up.
+
+=head1 ERROR CODES
 
 If we had an error we'll include an "error" key whose value is a
 bitfield that you can check against Hijk::Error::* constants. Those
@@ -368,12 +374,11 @@ Instead of the more verbose:
 
     .. if exists $res->{error} and $res->{error} & (Hijk::Error::CONNECT_TIMEOUT | Hijk::Error::READ_TIMEOUT)
 
-Hijk C<WILL> call die if any system calls that it executes fail with
-errors that aren't covered by C<Hijk::Error::*>, so wrap it in an
-C<eval> if you don't want to die in those cases. We just provide
-C<Hijk::Error::*> for non-exceptional failures like timeouts, not for
-e.g. you trying to connect to a host that doesn't exist or a socket
-unexpectedly going away etc.
+Hijk C<WILL> call die if any system calls that it executes fail with errors that
+aren't covered by C<Hijk::Error::*>, so wrap it in an C<eval> if you don't want
+to die in those cases. We just provide C<Hijk::Error::*> for non-exceptional
+failures like timeouts, not for e.g. you trying to connect to a host that
+doesn't exist or a socket unexpectedly going away etc.
 
 =head1 AUTHORS
 
@@ -384,6 +389,8 @@ unexpectedly going away etc.
 =item Ævar Arnfjörð Bjarmason <avar@cpan.org>
 
 =item Borislav Nikolov <jack@sofialondonmoskva.com>
+
+=item Damian Gryski <damian@gryski.com>
 
 =back
 
