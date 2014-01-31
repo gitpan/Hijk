@@ -27,6 +27,7 @@ t/build_http_message.t
 t/live-connect-timeout.t
 t/live-elasticsearch.t
 t/live-google.t
+t/live-invalid-domain.t
 t/live-plack.t
 t/parse-http-connection-close-message.t
 t/parse-http-message.t
