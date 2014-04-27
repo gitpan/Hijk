@@ -27,56 +27,28 @@ if ($iter == 0) {
 
 pass "ip generated = $ip";
 
-lives_ok {
-    my $res = Hijk::request({
+my ($res, $exception);
+
+eval {
+    $res = Hijk::request({
         host => $ip,
         port => 80,
-        timeout => 1            # seconds
+        timeout => 1 # seconds
     });
+    1;
+}
+or do {
+    $exception = $@ || "unknown error.";
+    $exception =~ s/\n//g;
+};
 
-    ok exists $res->{error}, '$res->{error} exists because we expect error to happen.';
+if ($exception) {
+    pass "On $^O, we have exception trying to connect to an unreachable IP: $exception";
+    is(scalar(keys %{$Hijk::SOCKET_CACHE}), 0, "We have nothing in the socket cache after the connect exception.");
+} else {
+    ok exists $res->{error}, "On $^O, ".'$res->{error} exists because we expect error to happen.';
     is $res->{error}, Hijk::Error::CONNECT_TIMEOUT, '$res->{error} contiain the value of Hijk::Error::CONNECT_TIMEOUT, indicating that it timed-out when establishing connection';
-} "We could make the request";
-is(scalar(keys %{$Hijk::SOCKET_CACHE}), 0, "We have nothing in the socket cache after a timeout");
-
-lives_ok {
-    my $res = Hijk::request({
-        host => 'google.com',
-        port => 80,
-        timeout => 0
-    });
-
-    ok !exists($res->{error}), '$res->{error} does not exist, because we do not expect connect timeout to happen';
-    cmp_ok scalar(keys %{$Hijk::SOCKET_CACHE}), '==', 1, "We have an entry in the global socket cache";
-    %{$Hijk::SOCKET_CACHE} = ();
-} "We could make the request";
-
-lives_ok {
-    my %socket_cache;
-    my $res = Hijk::request({
-        host => 'google.com',
-        port => 80,
-        timeout => 0,
-        socket_cache => \%socket_cache,
-    });
-
-    ok !exists($res->{error}), '$res->{error} does not exist, because we do not expect connect timeout to happen';
-    cmp_ok scalar(keys %{$Hijk::SOCKET_CACHE}), '==', 0, "We have nothing in the global socket cache...";
-    cmp_ok scalar(keys %socket_cache), '==', 1, "...because we used our own cache";
-} "We could make the request";
-
-lives_ok {
-    my %socket_cache;
-    my $res = Hijk::request({
-        host => 'google.com',
-        port => 80,
-        timeout => 0,
-        socket_cache => undef,
-    });
-
-    ok !exists($res->{error}), '$res->{error} does not exist, because we do not expect connect timeout to happen';
-    cmp_ok scalar(keys %{$Hijk::SOCKET_CACHE}), '==', 0, "We have nothing in the global socket cache";
-} "We could make the request";
+    is(scalar(keys %{$Hijk::SOCKET_CACHE}), 0, "We have nothing in the socket cache after a timeout");
+}
 
 done_testing;
-

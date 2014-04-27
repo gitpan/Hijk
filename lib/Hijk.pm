@@ -1,10 +1,10 @@
 package Hijk;
 use strict;
 use warnings;
-use POSIX qw(EINPROGRESS);
-use Socket qw(PF_INET SOCK_STREAM pack_sockaddr_in inet_ntoa $CRLF);
+use POSIX qw(:errno_h);
+use Socket qw(PF_INET SOCK_STREAM pack_sockaddr_in inet_ntoa $CRLF SOL_SOCKET SO_ERROR);
 use Fcntl qw(F_GETFL F_SETFL O_NONBLOCK);
-our $VERSION = "0.12";
+our $VERSION = "0.13";
 
 sub Hijk::Error::CONNECT_TIMEOUT () { 1 << 0 } # 1
 sub Hijk::Error::READ_TIMEOUT    () { 1 << 1 } # 2
@@ -12,22 +12,29 @@ sub Hijk::Error::TIMEOUT         () { Hijk::Error::READ_TIMEOUT() | Hijk::Error:
 sub Hijk::Error::CANNOT_RESOLVE  () { 1 << 2 } # 4
 #sub Hijk::Error::WHATEVER       () { 1 << 3 } # 8
 
-sub fetch {
+sub selectable_timeout {
+    my $t = shift;
+    return defined($t) && $t <=0 ? undef : $t;
+}
+
+sub read_http_message {
     my ($fd, $read_timeout,$block_size,$header,$head) = (shift,shift,10240,{},"");
-    my ($body,$buf,$decapitated,$nfound,$nbytes,$proto);
+    $read_timeout = selectable_timeout($read_timeout);
+    my ($body,$buf,$decapitated,$nbytes,$proto);
     my $status_code = 0;
     vec(my $rin = '', $fd, 1) = 1;
     do {
-        if ($read_timeout) {
-            $nfound = select($rin, undef, undef, $read_timeout);
-            die "select(2) error, errno = $!" if $nfound == -1;
-            return (undef,0,undef,undef, Hijk::Error::READ_TIMEOUT) unless $nfound == 1;
+        my $nfound = select($rin, undef, undef, $read_timeout);
+
+        return (undef,0,undef,undef, Hijk::Error::READ_TIMEOUT)
+            if ($nfound != 1 || (defined($read_timeout) && $read_timeout <= 0));
+
+        my $nbytes = POSIX::read($fd, $buf, $block_size);
+        if (!defined($nbytes)) {
+            next
+                if ($! == EWOULDBLOCK || $! == EAGAIN);
+            die "Failed to read http " .( $decapitated ? "body": "head" ). " from socket. errno = $!"
         }
-
-        $nbytes = POSIX::read($fd, $buf, $block_size);
-
-        die "Failed to read http " .( $decapitated ? "body": "head" ). " from socket. errno = $!"
-            unless defined $nbytes;
 
         die "Failed to read http " .( $decapitated ? "body": "head" ). " from socket. Got 0 bytes back, which shouldn't happen"
             if $nbytes == 0;
@@ -78,28 +85,29 @@ sub construct_socket {
         $addr = pack_sockaddr_in($port, $inet_aton);
     }
 
+    my $tcp_proto = getprotobyname("tcp");
     my $soc;
-    socket($soc, PF_INET, SOCK_STREAM, getprotobyname('tcp')) || die "Failed to construct TCP socket: $!";
-    my $flags;
-    if ($connect_timeout) {
-        $flags = fcntl($soc, F_GETFL, 0) or die "Failed to set fcntl F_GETFL flag for socket connect timeout (before connection): $!";
-        fcntl($soc, F_SETFL, $flags | O_NONBLOCK) or die "Failed to set fcntl O_NONBLOCK flag for socket connect timeout: $!";
-    }
-    connect($soc, $addr) or do {
-        if ($! == EINPROGRESS) {
-            vec(my $w = '', fileno($soc), 1) = 1;
-            my $n = select(undef, $w, undef, $connect_timeout);
-            unless ($n) {
-                return (undef, Hijk::Error::CONNECT_TIMEOUT);
-            }
+    socket($soc, PF_INET, SOCK_STREAM, $tcp_proto) || die "Failed to construct TCP socket: $!";
+    my $flags = fcntl($soc, F_GETFL, 0) or die "Failed to set fcntl F_GETFL flag: $!";
+    fcntl($soc, F_SETFL, $flags | O_NONBLOCK) or die "Failed to set fcntl O_NONBLOCK flag: $!";
 
-            die "select(2) error, errno = $!" if $n < 0;
+    if (!connect($soc, $addr) && $! != EINPROGRESS) {
+        die "Failed to connect $!";
+    }
+
+    $connect_timeout = selectable_timeout( $connect_timeout );
+    vec(my $rout = '', fileno($soc), 1) = 1;
+    my $nfound = select(undef, $rout, undef, $connect_timeout);
+    if ($nfound != 1) {
+        if (defined($connect_timeout)) {
+            return (undef, Hijk::Error::CONNECT_TIMEOUT);
         } else {
-            die "connect(2) error, errno = $!";
+            die "select() error on constructing the socket: $!";
         }
-    };
-    if ($connect_timeout) {
-        fcntl($soc, F_SETFL, $flags) or die "Failed to set fcntl F_GETFL flag for socket connect timeout (after connection): $!";
+    }
+
+    if ($! = unpack("L", getsockopt($soc, SOL_SOCKET, SO_ERROR))) {
+        die $!;
     }
 
     return $soc;
@@ -124,6 +132,7 @@ sub build_http_message {
 }
 
 our $SOCKET_CACHE = {};
+
 sub request {
     my $args = $_[0];
 
@@ -144,21 +153,36 @@ sub request {
         $soc = $args->{socket_cache}->{$cache_key};
     } else {
         ($soc, my $error) = construct_socket(@$args{qw(host port connect_timeout)});
-        return {error => $error} if defined $error; # To maybe return the CONNECT_TIMEOUT
+        return {error => $error} if defined $error;
         $args->{socket_cache}->{$cache_key} = $soc if defined $cache_key;
         $args->{on_connect}->() if exists $args->{on_connect};
     }
 
     my $r = build_http_message($args);
-    my $rc = syswrite($soc,$r);
-    if (!$rc || $rc != length($r)) {
-        delete $args->{socket_cache}->{$cache_key} if defined $cache_key;
-        shutdown($soc, 2);
-        die "send error ($r) $!";
+    my $total = length($r);
+    my $left = $total;
+
+    vec(my $rout = '', fileno($soc), 1) = 1;
+    while ($left > 0) {
+        my $nfound = select(undef, $rout, undef, undef);
+
+        if ($nfound != 1) {
+            delete $args->{socket_cache}->{$cache_key} if defined $cache_key;
+            die "select() error before write(): $!";
+        }
+
+        my $rc = syswrite($soc,$r,$left, $total - $left);
+        if (!defined($rc)) {
+            next if ($! == EWOULDBLOCK || $! == EAGAIN);
+            delete $args->{socket_cache}->{$cache_key} if defined $cache_key;
+            shutdown($soc, 2);
+            die "send error ($r) $!";
+        }
+        $left -= $rc;
     }
 
     my ($proto,$status,$body,$head,$error) = eval {
-        fetch(fileno($soc), $args->{read_timeout});
+        read_http_message(fileno($soc), $args->{read_timeout});
     } or do {
         my $err = $@ || "zombie error";
         delete $args->{socket_cache}->{$cache_key} if defined $cache_key;
@@ -290,13 +314,10 @@ the order of headers can be maintained. For example:
 Again, there are no extra character-escaping filters within Hijk.
 
 The value of C<connect_timeout> or C<read_timeout> is in seconds, and
-is used as the time limit for connecting to the host, and reading from
-the socket, respectively. You can't provide a non-zero read timeout
-without providing a non-zero connect timeout, as the socket has to be
-set up with the C<O_NONBLOCK> flag for the C<read_timeout> to work,
-which we only do if we have a C<connect_timeout>. The default value
-for both is C<0>, meaning no timeout limit. If the host is really
-unreachable or slow, we'll reach the TCP timeout limit before dying.
+is used as the time limit for connecting and writing to the host, and
+reading from the socket, respectively. The default value for both is
+C<0>, meaning no timeout limit. If the host is really unreachable or
+slow, we'll reach the TCP timeout limit before dying.
 
 The optional C<on_connect> callback is intended to be used for you to
 figure out from production traffic what you should set the
@@ -323,7 +344,7 @@ Alternatively you can pass in C<socket_cache> hash of your own which
 we'll use as the cache. To completely disable the cache pass in
 C<undef>.
 
-The return vaue is a HashRef representing a response. It contains the following
+The return value is a HashRef representing a response. It contains the following
 key-value pairs.
 
     proto  => :Str
@@ -344,7 +365,7 @@ following code:
     die "Response is not OK" unless $res->{status} ne "200";
 
 Notice that you do not need to put the leading C<"?"> character in the
-C<query_string>. You do, however, need to propery C<uri_escape> the content of
+C<query_string>. You do, however, need to properly C<uri_escape> the content of
 C<query_string>.
 
 All values are assumed to be valid. Hijk simply passes the values through without

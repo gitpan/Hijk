@@ -4,7 +4,7 @@
       "Kang-min Liu & Borislav Nikolov"
    ],
    "dynamic_config" : "0",
-   "generated_by" : "Module::Install version 1.06, CPAN::Meta::Converter version 2.132830",
+   "generated_by" : "Module::Install version 1.06, CPAN::Meta::Converter version 2.120921",
    "license" : [
       "mit"
    ],
@@ -45,8 +45,11 @@
    "resources" : {
       "license" : [
          "http://opensource.org/licenses/mit-license.php"
-      ]
+      ],
+      "repository" : {
+         "url" : "https://github.com/gugod/Hijk"
+      }
    },
-   "version" : "0.12",
+   "version" : "0.13",
    "x_module_name" : "Hijk"
 }

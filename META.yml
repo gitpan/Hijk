@@ -12,7 +12,7 @@ configure_requires:
   CPAN::Meta: 0
   ExtUtils::MakeMaker: 6.36
 dynamic_config: 0
-generated_by: 'Module::Install version 1.06, CPAN::Meta::Converter version 2.132830'
+generated_by: 'Module::Install version 1.06, CPAN::Meta::Converter version 2.120921'
 license: mit
 meta-spec:
   url: http://module-build.sourceforge.net/META-spec-v1.4.html
@@ -25,5 +25,6 @@ no_index:
     - t
 resources:
   license: http://opensource.org/licenses/mit-license.php
-version: 0.12
+  repository: https://github.com/gugod/Hijk
+version: 0.13
 x_module_name: Hijk
