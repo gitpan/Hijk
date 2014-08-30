@@ -1,3 +1,24 @@
+0.15: # 2014-08-31T00:10:00+000
+- Major Change: There are several new Hijk::Error::* constants for
+  common issues that happened during normal requests in the face of
+  regular exceptions out of the control of this library, such as
+  network blips.
+
+  Existing code that checks $res->{error} should be
+  forwards-compatible with this change, but anything that was doing
+  e.g. regex checks against regular errors thrown by this library
+  should be updated to check the new Hijk::Error::* constants instead.
+
+- It's now possible to specify "head_as_array" to get the returned
+  headers as an array (with potential duplicated headers), rather than
+  the default behavior of lossily returning them as a hash.
+
+- There's now a "read_length" option to control how much we
+  POSIX::read($fd, $buf, $read_length) at a time. We don't expect this
+  to be useful, it's mainly configurable on general principle so we
+  don't have arbitrary unconfigurable hardcoded constants in the
+  source.
+
 0.15: # 2014-08-30T10:00:00+000
 - The new code to support chunked transfer encoding would return a
   nonexisting Hijk::Error::* value of "0" when it encountered a read

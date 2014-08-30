@@ -1,5 +1,5 @@
 {
-   "abstract" : "Specialized HTTP client",
+   "abstract" : "Fast & minimal raw HTTP client",
    "author" : [
       "Kang-min Liu & Borislav Nikolov"
    ],
@@ -51,6 +51,6 @@
          "url" : "https://github.com/gugod/Hijk"
       }
    },
-   "version" : "0.15",
+   "version" : "0.16",
    "x_module_name" : "Hijk"
 }

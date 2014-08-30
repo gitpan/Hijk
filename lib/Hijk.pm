@@ -4,13 +4,19 @@ use warnings;
 use POSIX qw(:errno_h);
 use Socket qw(PF_INET SOCK_STREAM pack_sockaddr_in inet_ntoa $CRLF SOL_SOCKET SO_ERROR);
 use Fcntl qw(F_GETFL F_SETFL O_NONBLOCK);
-our $VERSION = "0.15";
 
-sub Hijk::Error::CONNECT_TIMEOUT () { 1 << 0 } # 1
-sub Hijk::Error::READ_TIMEOUT    () { 1 << 1 } # 2
-sub Hijk::Error::TIMEOUT         () { Hijk::Error::READ_TIMEOUT() | Hijk::Error::CONNECT_TIMEOUT() } # 3
-sub Hijk::Error::CANNOT_RESOLVE  () { 1 << 2 } # 4
-#sub Hijk::Error::WHATEVER       () { 1 << 3 } # 8
+our $VERSION = "0.16";
+
+sub Hijk::Error::CONNECT_TIMEOUT         () { 1 << 0 } # 1
+sub Hijk::Error::READ_TIMEOUT            () { 1 << 1 } # 2
+sub Hijk::Error::TIMEOUT                 () { Hijk::Error::READ_TIMEOUT | Hijk::Error::CONNECT_TIMEOUT } # 3
+sub Hijk::Error::CANNOT_RESOLVE          () { 1 << 2 } # 4
+sub Hijk::Error::REQUEST_SELECT_ERROR    () { 1 << 3 } # 8
+sub Hijk::Error::REQUEST_WRITE_ERROR     () { 1 << 4 } # 16
+sub Hijk::Error::REQUEST_ERROR           () { Hijk::Error::REQUEST_SELECT_ERROR |  Hijk::Error::REQUEST_WRITE_ERROR } # 24
+sub Hijk::Error::RESPONSE_READ_ERROR     () { 1 << 5 } # 32
+sub Hijk::Error::RESPONSE_BAD_READ_VALUE () { 1 << 6 } # 64
+sub Hijk::Error::RESPONSE_ERROR          () { Hijk::Error::RESPONSE_READ_ERROR | Hijk::Error::RESPONSE_BAD_READ_VALUE } # 96
 
 sub _selectable_timeout {
     my $t = shift;
@@ -18,32 +24,45 @@ sub _selectable_timeout {
 }
 
 sub _read_http_message {
-    my ($fd, $read_timeout, $parse_chunked, $block_size,$header,$head) = (shift,shift,shift,10240,{},"");
+    my ($fd, $read_length, $read_timeout, $parse_chunked, $head_as_array) = @_;
     $read_timeout = _selectable_timeout($read_timeout);
     my ($body,$buf,$decapitated,$nbytes,$proto);
     my $status_code = 0;
+    my $header = $head_as_array ? [] : {};
     my $no_content_len = 0;
+    my $head = "";
     vec(my $rin = '', $fd, 1) = 1;
     do {
         my $nfound = select($rin, undef, undef, $read_timeout);
-        return (undef,0,undef,undef, Hijk::Error::READ_TIMEOUT)
+        return (undef,undef,0,undef,undef, Hijk::Error::READ_TIMEOUT)
             if ($nfound != 1 || (defined($read_timeout) && $read_timeout <= 0));
 
-        my $nbytes = POSIX::read($fd, $buf, $block_size);
-        return ($proto, $status_code, $header, $body)
+        my $nbytes = POSIX::read($fd, $buf, $read_length);
+        return ($proto, undef, $status_code, $header, $body)
             if $no_content_len && $decapitated && (!defined($nbytes) || $nbytes == 0);
         if (!defined($nbytes)) {
             next if ($! == EWOULDBLOCK || $! == EAGAIN);
-            die "Failed to read http " .( $decapitated ? "body": "head" ). " from socket. errno = $!"
+            return (
+                undef, undef, 0, undef, undef,
+                Hijk::Error::RESPONSE_READ_ERROR,
+                "Failed to read http " . ($decapitated ? "body": "head") . " from socket",
+                $!+0,
+                "$!",
+            );
         }
 
-        die "Failed to read http " .( $decapitated ? "body": "head" ). " from socket. Got 0 bytes back, which shouldn't happen"
-            if $nbytes == 0;
+        if ($nbytes == 0) {
+            return (
+                undef, undef, 0, undef, undef,
+                Hijk::Error::RESPONSE_BAD_READ_VALUE,
+                "Wasn't expecting a 0 byte response for http " . ($decapitated ? "body": "head" ) . ". This shouldn't happen",
+            );
+        }
 
         if ($decapitated) {
             $body .= $buf;
             if (!$no_content_len) {
-                $block_size -= $nbytes;
+                $read_length -= $nbytes;
             }
         }
         else {
@@ -57,38 +76,67 @@ sub _read_http_message {
                 $status_code = substr($head, 9, 3);
                 substr($head, 0, index($head, $CRLF) + 2, ""); # 2 = length($CRLF)
 
+                my ($doing_chunked, $content_length, $close_connection, $trailer_mode);
                 for (split /${CRLF}/o, $head) {
                     my ($key, $value) = split /: /, $_, 2;
-                    $header->{$key} = $value;
+
+                    if ($head_as_array) {
+                        push @$header => $key, $value;
+
+                        # Figure this out now so we don't need to scan
+                        # the list later.
+                        if ($key eq 'Transfer-Encoding' and $value eq 'chunked') {
+                            $doing_chunked = 1;
+                        } elsif ($key eq 'Content-Length') {
+                            $content_length = $value;
+                        } elsif ($key eq 'Connection' and $value eq 'close') {
+                            $close_connection = 1
+                        } elsif ($doing_chunked and $key eq 'Trailer' and $value) {
+                            $trailer_mode = 1;
+                        }
+                    } else {
+                        $header->{$key} = $value;
+                    }
                 }
-                if ($header->{'Transfer-Encoding'} && $header->{'Transfer-Encoding'} eq 'chunked') {
+
+                if (($head_as_array and $doing_chunked)
+                    or
+                    (!$head_as_array and ($header->{'Transfer-Encoding'} and $header->{'Transfer-Encoding'} eq 'chunked'))) {
                     die "PANIC: The experimental Hijk support for chunked transfer encoding needs to be explicitly enabled with parse_chunked => 1"
                         unless $parse_chunked;
 
                     # if there is chunked encoding we have to ignore content lenght even if we have it
-                    return ($proto, $status_code, $header, _read_chunked_body($body, $fd, $read_timeout,$header));
+                    return (
+                        $close_connection, $proto, $status_code, $header,
+                        _read_chunked_body(
+                            $body, $fd, $read_length, $read_timeout,
+                            $head_as_array
+                              ? $trailer_mode
+                              : ($header->{Trailer} ? 1 : 0),
+                        ),
+                    );
                 }
 
-                if ($header->{'Content-Length'}) {
-                    $block_size = $header->{'Content-Length'} - length($body);
-                }
-                else {
-                    $block_size = 10204;
+                if ($head_as_array and $content_length) {
+                    $read_length = $content_length - length($body);
+                } elsif (!$head_as_array and $header->{'Content-Length'}) {
+                    $read_length = $header->{'Content-Length'} - length($body);
+                } else {
+                    $read_length = 10204;
                     $no_content_len = 1;
                 }
             }
         }
 
-    } while( !$decapitated || $block_size > 0 || $no_content_len);
-    return ($proto, $status_code, $header, $body);
+    } while( !$decapitated || $read_length > 0 || $no_content_len);
+    return (undef, $proto, $status_code, $header, $body);
 }
 
 sub _read_chunked_body {
-    my ($buf,$fd, $read_timeout,$header) = @_;
+    my ($buf,$fd,$read_length,$read_timeout,$true_trailer_header) = @_;
     my $chunk_size   = 0;
     my $body         = "";
-    my $block_size = 10240;
-    my $trailer_mode  = 0;
+    my $trailer_mode = 0;
 
     vec(my $rin = '', $fd, 1) = 1;
     while(1) {
@@ -98,15 +146,26 @@ sub _read_chunked_body {
             return (undef, Hijk::Error::READ_TIMEOUT)
                 if ($nfound != 1 || (defined($read_timeout) && $read_timeout <= 0));
             my $current_buf = "";
-            my $nbytes = POSIX::read($fd, $current_buf, $block_size);
+            my $nbytes = POSIX::read($fd, $current_buf, $read_length);
             if (!defined($nbytes)) {
-                next
-                    if ($! == EWOULDBLOCK || $! == EAGAIN);
-                die "Failed to read chunked body from socket. errno = $!"
+                next if ($! == EWOULDBLOCK || $! == EAGAIN);
+                return (
+                    undef,
+                    Hijk::Error::RESPONSE_READ_ERROR,
+                    "Failed to chunked http body from socket",
+                    $!+0,
+                    "$!",
+                );
             }
 
-            die "Failed to read chunked body from socket. Got 0 bytes back, which shouldn't happen <$buf> <$current_buf>"
-                if $nbytes == 0;
+            if ($nbytes == 0) {
+                return (
+                    undef,
+                    Hijk::Error::RESPONSE_BAD_READ_VALUE,
+                    "Wasn't expecting a 0 byte response for chunked http body. This shouldn't happen, buf:<$buf>, current_buf:<$current_buf>",
+                );
+            }
+
             $buf .= $current_buf;
         }
         if ($trailer_mode) {
@@ -142,7 +201,7 @@ sub _read_chunked_body {
                 if ($neck_pos > 0) {
                     $chunk_size = hex(substr($buf, 0, $neck_pos));
                     if ($chunk_size == 0) {
-                        if ($header->{Trailer}) {
+                        if ($true_trailer_header) {
                             $trailer_mode = 1;
                         } else {
                             return $body;
@@ -165,7 +224,7 @@ sub _construct_socket {
     my $addr;
     {
         my $inet_aton = gethostbyname($host);
-        return (undef, Hijk::Error::CANNOT_RESOLVE) unless defined $inet_aton;
+        return (undef, {error => Hijk::Error::CANNOT_RESOLVE}) unless defined $inet_aton;
         $addr = pack_sockaddr_in($port, $inet_aton);
     }
 
@@ -184,9 +243,17 @@ sub _construct_socket {
     my $nfound = select(undef, $rout, undef, $connect_timeout);
     if ($nfound != 1) {
         if (defined($connect_timeout)) {
-            return (undef, Hijk::Error::CONNECT_TIMEOUT);
+            return (undef, {error => Hijk::Error::CONNECT_TIMEOUT});
         } else {
-            die "select() error on constructing the socket: $!";
+            return (
+                undef,
+                {
+                    error         => Hijk::Error::REQUEST_SELECT_ERROR,
+                    error_message => "select() error on constructing the socket",
+                    errno_number  => $!+0,
+                    errno_string  => "$!",
+                },
+            );
         }
     }
 
@@ -228,6 +295,9 @@ sub request {
     # to "socket_cache => undef" to disable the cache.
     $args->{socket_cache} = $SOCKET_CACHE unless exists $args->{socket_cache};
 
+    # Provide a default for the read_length option
+    $args->{read_length} = 10 * 2 ** 10 unless exists $args->{read_length};
+
     # Use $; so we can use the $socket_cache->{$$, $host, $port}
     # idiom to access the cache.
     my $cache_key; $cache_key = join($;, $$, @$args{qw(host port)}) if defined $args->{socket_cache};
@@ -237,7 +307,7 @@ sub request {
         $soc = $args->{socket_cache}->{$cache_key};
     } else {
         ($soc, my $error) = _construct_socket(@$args{qw(host port connect_timeout)});
-        return {error => $error} if defined $error;
+        return $error if $error;
         $args->{socket_cache}->{$cache_key} = $soc if defined $cache_key;
         $args->{on_connect}->() if exists $args->{on_connect};
     }
@@ -252,7 +322,12 @@ sub request {
 
         if ($nfound != 1) {
             delete $args->{socket_cache}->{$cache_key} if defined $cache_key;
-            die "select() error before write(): $!";
+            return {
+                error         => Hijk::Error::REQUEST_SELECT_ERROR,
+                error_message => "Got error on select() before the write() when while writing the HTTP request the socket",
+                errno_number  => $!+0,
+                errno_string  => "$!",
+            };
         }
 
         my $rc = syswrite($soc,$r,$left, $total - $left);
@@ -260,14 +335,20 @@ sub request {
             next if ($! == EWOULDBLOCK || $! == EAGAIN);
             delete $args->{socket_cache}->{$cache_key} if defined $cache_key;
             shutdown($soc, 2);
-            die "send error ($r) $!";
+            return {
+                error         => Hijk::Error::REQUEST_WRITE_ERROR,
+                error_message => "Got error trying to write the HTTP request with write() to the socket",
+                errno_number  => $!+0,
+                errno_string  => "$!",
+            };
         }
         $left -= $rc;
     }
 
-    my ($proto,$status,$head,$body,$error);
+    my ($proto,$close_connection,$status,$head,$body,$error,$error_message,$errno_number,$errno_string);
     eval {
-        ($proto,$status,$head,$body,$error) = _read_http_message(fileno($soc), $args->{read_timeout}, $args->{parse_chunked});
+        ($close_connection,$proto,$status,$head,$body,$error,$error_message,$errno_number,$errno_string) =
+        _read_http_message(fileno($soc), @$args{qw(read_length read_timeout parse_chunked head_as_array)});
         1;
     } or do {
         my $err = $@ || "zombie error";
@@ -283,8 +364,8 @@ sub request {
         # ShardedKV::Storage::Rest tests) is an example of such a
         # server. In either case we can't cache a connection for a 1.0
         # server anyway, so BEGONE!
-        or (defined $proto and $proto eq 'HTTP/1.0')
-        or ($head->{Connection} && $head->{Connection} eq 'close')) {
+        or $close_connection
+        or (defined $proto and $proto eq 'HTTP/1.0')) {
         delete $args->{socket_cache}->{$cache_key} if defined $cache_key;
         shutdown($soc, 2);
     }
@@ -294,6 +375,9 @@ sub request {
         head => $head,
         body => $body,
         defined($error) ? ( error => $error ) : (),
+        defined($error_message) ? ( error_message => $error_message ) : (),
+        defined($errno_number) ? ( errno_number => $errno_number ) : (),
+        defined($errno_string) ? ( errno_string => $errno_string ) : (),
     };
 }
 
@@ -305,13 +389,13 @@ __END__
 
 =head1 NAME
 
-Hijk - Specialized HTTP client
+Hijk - Fast & minimal raw HTTP client
 
 =head1 SYNOPSIS
 
 A simple GET request:
 
-    use Hijk;
+    use Hijk ();
     my $res = Hijk::request({
         method       => "GET",
         host         => "example.com",
@@ -324,14 +408,14 @@ A simple GET request:
         die "Oh noes we had some sort of timeout";
     }
 
-    die unless ($res->{status} == "200");
+    die "Expecting a successful response" unless $res->{status} == 200;
 
     say $res->{body};
 
 A POST request, you have to manually set the appropriate headers, URI
 escape your values etc.
 
-    use Hijk;
+    use Hijk ();
     use URI::Escape qw(uri_escape);
 
     my $res = Hijk::request({
@@ -344,67 +428,103 @@ escape your values etc.
         body         => "description=" . uri_escape("Another flower, let's hope it's exciting"),
     });
 
-    die unless ($res->{status} == "200");
+    die "Expecting a successful response" unless $res->{status} == 200;
 
 =head1 DESCRIPTION
 
-Hijk is a specialized HTTP Client that does nothing but transport the
-response body back. It does not feature as a "user agent", but as a dumb
-client. It is suitable for connecting to data servers transporting via HTTP
-rather then web servers.
+Hijk is a fast & minimal raw HTTP client intended to be used where you
+control both the client and the server, e.g. for talking to some
+internal service from a frontend user-facing web application.
 
-Most of HTTP features like proxy, redirect, Transfer-Encoding, or SSL are not
-supported at all. For those requirements we already have many good HTTP clients
-like L<HTTP::Tiny>, L<Furl> or L<LWP::UserAgent>.
+It is C<NOT> a general HTTP user agent, it doesn't support redirects,
+proxies, SSL and any number of other advanced HTTP features like (in
+roughly descending order of feature completeness) L<LWP::UserAgent>,
+L<WWW::Curl>, L<HTTP::Tiny>, L<HTTP::Lite> or L<Furl>. This library is
+basically one step above manually talking HTTP over sockets.
 
+Having said that it's lightning fast and extensively used in
+production at L<Booking.com|https://www.booking.com> where it's used
+as the go-to transport layer for talking to internal services. It uses
+non-blocking sockets and correctly handles all combinations of
+connect/read timeouts and other issues you might encounter from
+various combinations of parts of your system going down or becoming
+otherwise unavailable.
 
 =head1 FUNCTION: Hijk::request( $args :HashRef ) :HashRef
 
-C<Hijk::request> is the only function to be used. It is not exported to its
-caller namespace at all. It takes a request arguments in HashRef and returns the
-response in HashRef.
+C<Hijk::request> function you should use. It (or anything else in this
+package for that matter) is not exported, so you have to use the fully
+qualified name. It takes a C<HashRef> of arguments and either dies or
+returns a C<HashRef> as a response.
 
-The C<$args> request arg should be a HashRef containing key-value pairs from the
-following list. The value for C<host> and C<port> are mandatory and others are
-optional with default values listed below
+The argument to it must be a C<HashRef> containing some of the
+key-value pairs from the following list. The value for C<host> and
+C<port> are mandatory, but others are optional with default values
+listed below
 
     protocol        => "HTTP/1.1", # (or "HTTP/1.0")
     host            => ...,
     port            => ...,
-    connect_timeout => 0,
-    read_timeout    => 0,
+    connect_timeout => undef,
+    read_timeout    => undef,
+    read_length     => 10240,
     method          => "GET",
     path            => "/",
     query_string    => "",
     head            => [],
     body            => "",
-    socket_cache    => {}, # (undef to disable, or \my %your_socket_cache)
+    socket_cache    => \%Hijk::SOCKET_CACHE, # (undef to disable, or \my %your_socket_cache)
     on_connect      => undef, # (or sub { ... })
     parse_chunked   => 0,
+    head_as_array   => 0,
 
-To keep the implementation minimal, Hijk does not take full URL string as
-input. User who need to parse URL string could use L<URI> modules.
+Notice how Hijk does not take a full URI string as input, you have to
+specify the individual parts of the URL. Users who need to parse an
+existing URI string to produce a request should use the L<URI> module
+to do so.
 
-The value of C<head> is an ArrayRef of key-value pairs instead of HashRef, this way
-the order of headers can be maintained. For example:
+The value of C<head> is an C<ArrayRef> of key-value pairs instead of a
+C<HashRef>, this way you can decide in which order the headers are
+sent, and you can send the same header name multiple times. For
+example:
 
     head => [
         "Content-Type" => "application/json",
         "X-Requested-With" => "Hijk",
     ]
 
-... will produce these request headers:
+Will produce these request headers:
 
     Content-Type: application/json
     X-Requested-With: Hijk
 
-Again, there are no extra character-escaping filters within Hijk.
+Hijk doesn't escape any values for you, it just passes them through
+as-is. You can easily produce corrupt requests if e.g. any of these
+strings contain a newline, or aren't otherwise properly escaped.
 
-The value of C<connect_timeout> or C<read_timeout> is in seconds, and
-is used as the time limit for connecting and writing to the host, and
-reading from the socket, respectively. The default value for both is
-C<0>, meaning no timeout limit. If the host is really unreachable or
-slow, we'll reach the TCP timeout limit before dying.
+The value of C<connect_timeout> or C<read_timeout> is in floating
+point seconds, and is used as the time limit for connecting and
+writing to the host, and reading from the socket, respectively. The
+default value for both is C<0>, meaning no timeout limit. If you don't
+supply these timeouts and the host really is unreachable or slow,
+we'll reach the TCP timeout limit before returning some other error to
+you.
+
+The default C<protocol> is C<HTTP/1.1>, but you can also specify
+C<HTTP/1.0>. The advantage of using HTTP/1.1 is support for
+keep-alive, which matters a lot in environments where the connection
+setup represents non-trivial overhead. Sometimes that overhead is
+negligible (e.g. on Linux talking to an nginx on the local network),
+and keeping open connections down and reducing complexity is more
+important, in those cases you can either use C<HTTP/1.0>, or specify
+C<Connection: close> in the request, but just using C<HTTP/1.0> is an
+easy way to accomplish the same thing.
+
+By default we will provide a C<socket_cache> for you which is a global
+singleton that we maintain keyed on C<join($;, $$, $host, $port)>.
+Alternatively you can pass in C<socket_cache> hash of your own which
+we'll use as the cache. To completely disable the cache pass in
+C<undef>.
 
 The optional C<on_connect> callback is intended to be used for you to
 figure out from production traffic what you should set the
@@ -417,20 +537,6 @@ constructed the socket, i.e. it'll help you to tweak your
 C<read_timeout>. The C<on_connect> callback is provided with no
 arguments, and is called in void context.
 
-The default C<protocol> is C<HTTP/1.1>, but you can also specify
-C<HTTP/1.0>. The advantage of using HTTP/1.1 is support for
-keep-alive, which matters a lot in environments where the connection
-setup represents non-trivial overhead. Sometimes that overhead is
-negligible (e.g. on Linux talking to an nginx on the local network),
-and keeping open connections down and reducing complexity is more
-important, in those cases you can use C<HTTP/1.0>.
-
-By default we will provide a C<socket_cache> for you which is a global
-singleton that we maintain keyed on C<join($;, $$, $host, $port)>.
-Alternatively you can pass in C<socket_cache> hash of your own which
-we'll use as the cache. To completely disable the cache pass in
-C<undef>.
-
 We have experimental support for parsing chunked responses
 encoding. historically Hijk didn't support this at all and if you
 wanted to use it with e.g. nginx you had to add
@@ -441,17 +547,20 @@ explicitly enable it with C<parse_chunked>. Otherwise Hijk will die
 when it encounters chunked responses. The C<parse_chunked> option may
 be turned on by default in the future.
 
-The return value is a HashRef representing a response. It contains the following
-key-value pairs.
+The return value is a C<HashRef> representing a response. It contains
+the following key-value pairs.
 
-    proto  => :Str
-    status => :StatusCode
-    body   => :Str
-    head   => :HashRef
-    error  => :Int
+    proto         => :Str
+    status        => :StatusCode
+    body          => :Str
+    head          => :HashRef
+    error         => :Int
+    error_message => :Str
+    errno_number  => :Int
+    errno_string  => :Str
 
-For example, to send request to C<http://example.com/flower?color=red>, use the
-following code:
+For example, to send request to
+C<http://example.com/flower?color=red>, do the following:
 
     my $res = Hijk::request({
         host => "example.com",
@@ -459,18 +568,24 @@ following code:
         path => "/flower",
         query_string => "color=red"
     });
-    die "Response is not OK" unless $res->{status} ne "200";
+    die "Response is not OK" unless $res->{status} == 200;
 
 Notice that you do not need to put the leading C<"?"> character in the
 C<query_string>. You do, however, need to properly C<uri_escape> the content of
 C<query_string>.
 
-All values are assumed to be valid. Hijk simply passes the values through without
-validating the content. It is possible that it constructs invalid HTTP Messages.
-Users should keep this in mind when using Hijk.
+Again, Hijk doesn't escape any values for you, so these values B<MUST>
+be properly escaped before being passed in, unless you want to issue
+invalid requests.
 
-Noticed that the C<head> in the response is a HashRef rather then an ArrayRef.
-This makes it easier to retrieve specific header fields.
+By default the C<head> in the response is a C<HashRef> rather then an
+C<ArrayRef>. This makes it easier to retrieve specific header fields,
+but it means that we'll clobber any duplicated header names with the
+most recently seen header value. To get the returned headers as an
+C<ArrayRef> instead specify C<head_as_array>.
+
+If you want to fiddle with the C<read_length> value it controls how
+much we C<POSIX::read($fd, $buf, $read_length)> at a time.
 
 We currently don't support servers returning a http body without an accompanying
 C<Content-Length> header; bodies B<MUST> have a C<Content-Length> or we won't pick
@@ -478,9 +593,9 @@ them up.
 
 =head1 ERROR CODES
 
-If we had an error we'll include an "error" key whose value is a
-bitfield that you can check against Hijk::Error::* constants. Those
-are:
+If we had a recoverable error we'll include an "error" key whose value
+is a bitfield that you can check against Hijk::Error::*
+constants. Those are:
 
 =over 4
 
@@ -492,9 +607,25 @@ are:
 
 =item Hijk::Error::CANNOT_RESOLVE
 
+=item Hijk::Error::REQUEST_SELECT_ERROR
+
+=item Hijk::Error::REQUEST_WRITE_ERROR
+
+=item Hijk::Error::REQUEST_ERROR
+
+=item Hijk::Error::RESPONSE_READ_ERROR
+
+=item Hijk::Error::RESPONSE_BAD_READ_VALUE
+
+=item Hijk::Error::RESPONSE_ERROR
+
 =back
 
-The Hijk::Error::TIMEOUT constant is the same as
+In addition we might return C<error_message>, C<errno_number> and
+C<errno_string> keys, see the discussion of C<Hijk::Error::REQUEST_*>
+and C<Hijk::Error::RESPONSE_*> errors below.
+
+The C<Hijk::Error::TIMEOUT> constant is the same as
 C<Hijk::Error::CONNECT_TIMEOUT | Hijk::Error::READ_TIMEOUT>. It's
 there for convenience so you can do:
 
@@ -504,14 +635,48 @@ Instead of the more verbose:
 
     .. if exists $res->{error} and $res->{error} & (Hijk::Error::CONNECT_TIMEOUT | Hijk::Error::READ_TIMEOUT)
 
-We'll return Hijk::Error::CANNOT_RESOLVE if we can't
+We'll return C<Hijk::Error::CANNOT_RESOLVE> if we can't
 C<gethostbyname()> the host you've provided.
 
-Hijk C<WILL> call die if any system calls that it executes fail with errors that
-aren't covered by C<Hijk::Error::*>, so wrap it in an C<eval> if you don't want
-to die in those cases. We just provide C<Hijk::Error::*> for non-exceptional
-failures like timeouts, not for e.g. you trying to connect to a host that
-doesn't exist or a socket unexpectedly going away etc.
+If we fail to do a C<select()> or C<write()> during when sending the
+response we'll return C<Hijk::Error::REQUEST_SELECT_ERROR> or
+C<Hijk::Error::REQUEST_WRITE_ERROR>, respectively. similar to
+C<Hijk::Error::TIMEOUT> the C<Hijk::Error::REQUEST_ERROR> constant is
+a union of these two and any other request errors we might add in the
+future.
+
+When we're getting the response back we'll return
+C<Hijk::Error::RESPONSE_READ_ERROR> when we can't C<read()> the
+response, and C<Hijk::Error::RESPONSE_BAD_READ_VALUE> when the value
+we got from C<read()> is C<0>. The C<Hijk::Error::RESPONSE_ERROR>
+constant is a union of these two and any other response errors we
+might add in the future.
+
+Some of these C<Hijk::Error::REQUEST_*> and C<Hijk::Error::RESPONSE_*>
+errors are re-thrown errors from system calls. In that case we'll also
+pass along C<error_message> which is a short human readable error
+message about the error, and C<errno_number> & C<errno_string>, which
+are C<$!+0> and C<"$!"> at the time we had the error.
+
+Hijk might encounter other errors during the course of the request and
+C<WILL> call C<die> if that happens, so if you don't want your program
+to stop when a request like that fails wrap it in C<eval>.
+
+Having said that the point of the C<Hijk::Error::*> interface is that
+all errors that happen during normal operation, i.e. making valid
+requests against servers where you can have issues like timeouts,
+network blips or the server thread on the other end being suddenly
+kill -9'd should be caught, categorized and returned in a structural
+way by Hijk.
+
+We're not currently aware of any issues that occur in such normal
+operations that aren't classified as a C<Hijk::Error::*>, and if we
+find new issues that fit the criteria above we'll likely just make a
+new C<Hijk::Error::*> for it.
+
+We're just not trying to guarantee that the library can never C<die>,
+and aren't trying to catch truly exceptional issues like
+e.g. C<fcntl()> failing on a valid socket.
 
 =head1 AUTHORS
 

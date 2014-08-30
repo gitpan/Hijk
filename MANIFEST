@@ -28,6 +28,7 @@ README.md
 t/bin/it-takes-time.psgi
 t/bin/split-in-chunks.psgi
 t/build_http_message.t
+t/chunked-trailer-head-as-array.t
 t/chunked-trailer.t
 t/chunked.t
 t/live-connect-timeout.t
@@ -37,5 +38,6 @@ t/live-google.t
 t/live-invalid-domain.t
 t/live-plack.t
 t/parse-http-connection-close-message.t
+t/parse-http-message-head-as-array.t
 t/parse-http-message.t
 t/parse-http-no-content-len-message.t
