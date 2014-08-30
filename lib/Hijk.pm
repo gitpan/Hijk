@@ -4,7 +4,7 @@ use warnings;
 use POSIX qw(:errno_h);
 use Socket qw(PF_INET SOCK_STREAM pack_sockaddr_in inet_ntoa $CRLF SOL_SOCKET SO_ERROR);
 use Fcntl qw(F_GETFL F_SETFL O_NONBLOCK);
-our $VERSION = "0.14";
+our $VERSION = "0.15";
 
 sub Hijk::Error::CONNECT_TIMEOUT () { 1 << 0 } # 1
 sub Hijk::Error::READ_TIMEOUT    () { 1 << 1 } # 2
@@ -12,14 +12,14 @@ sub Hijk::Error::TIMEOUT         () { Hijk::Error::READ_TIMEOUT() | Hijk::Error:
 sub Hijk::Error::CANNOT_RESOLVE  () { 1 << 2 } # 4
 #sub Hijk::Error::WHATEVER       () { 1 << 3 } # 8
 
-sub selectable_timeout {
+sub _selectable_timeout {
     my $t = shift;
     return defined($t) && $t <=0 ? undef : $t;
 }
 
-sub read_http_message {
-    my ($fd, $read_timeout,$block_size,$header,$head) = (shift,shift,10240,{},"");
-    $read_timeout = selectable_timeout($read_timeout);
+sub _read_http_message {
+    my ($fd, $read_timeout, $parse_chunked, $block_size,$header,$head) = (shift,shift,shift,10240,{},"");
+    $read_timeout = _selectable_timeout($read_timeout);
     my ($body,$buf,$decapitated,$nbytes,$proto);
     my $status_code = 0;
     my $no_content_len = 0;
@@ -30,11 +30,10 @@ sub read_http_message {
             if ($nfound != 1 || (defined($read_timeout) && $read_timeout <= 0));
 
         my $nbytes = POSIX::read($fd, $buf, $block_size);
-        return ($proto, $status_code, $body, $header)
+        return ($proto, $status_code, $header, $body)
             if $no_content_len && $decapitated && (!defined($nbytes) || $nbytes == 0);
         if (!defined($nbytes)) {
-            next
-                if ($! == EWOULDBLOCK || $! == EAGAIN);
+            next if ($! == EWOULDBLOCK || $! == EAGAIN);
             die "Failed to read http " .( $decapitated ? "body": "head" ). " from socket. errno = $!"
         }
 
@@ -63,8 +62,11 @@ sub read_http_message {
                     $header->{$key} = $value;
                 }
                 if ($header->{'Transfer-Encoding'} && $header->{'Transfer-Encoding'} eq 'chunked') {
+                    die "PANIC: The experimental Hijk support for chunked transfer encoding needs to be explicitly enabled with parse_chunked => 1"
+                        unless $parse_chunked;
+
                     # if there is chunked encoding we have to ignore content lenght even if we have it
-                    return ($proto, $status_code, read_chunked_body($body, $fd, $read_timeout,$header), $header);
+                    return ($proto, $status_code, $header, _read_chunked_body($body, $fd, $read_timeout,$header));
                 }
 
                 if ($header->{'Content-Length'}) {
@@ -78,10 +80,10 @@ sub read_http_message {
         }
 
     } while( !$decapitated || $block_size > 0 || $no_content_len);
-    return ($proto, $status_code, $body, $header);
+    return ($proto, $status_code, $header, $body);
 }
 
-sub read_chunked_body {
+sub _read_chunked_body {
     my ($buf,$fd, $read_timeout,$header) = @_;
     my $chunk_size   = 0;
     my $body         = "";
@@ -93,7 +95,7 @@ sub read_chunked_body {
         # just read a 10k block and process it until it is consumed
         if (length($buf) == 0 || length($buf) < $chunk_size) {
             my $nfound = select($rin, undef, undef, $read_timeout);
-            return (undef,0,undef,undef, Hijk::Error::READ_TIMEOUT)
+            return (undef, Hijk::Error::READ_TIMEOUT)
                 if ($nfound != 1 || (defined($read_timeout) && $read_timeout <= 0));
             my $current_buf = "";
             my $nbytes = POSIX::read($fd, $current_buf, $block_size);
@@ -155,7 +157,7 @@ sub read_chunked_body {
     }
 }
 
-sub construct_socket {
+sub _construct_socket {
     my ($host, $port, $connect_timeout) = @_;
 
     # If we can't find the IP address there'll be no point in even
@@ -177,7 +179,7 @@ sub construct_socket {
         die "Failed to connect $!";
     }
 
-    $connect_timeout = selectable_timeout( $connect_timeout );
+    $connect_timeout = _selectable_timeout( $connect_timeout );
     vec(my $rout = '', fileno($soc), 1) = 1;
     my $nfound = select(undef, $rout, undef, $connect_timeout);
     if ($nfound != 1) {
@@ -195,7 +197,7 @@ sub construct_socket {
     return $soc;
 }
 
-sub build_http_message {
+sub _build_http_message {
     my $args = $_[0];
     my $path_and_qs = ($args->{path} || "/") . ( defined($args->{query_string}) ? ("?".$args->{query_string}) : "" );
     return join(
@@ -234,13 +236,13 @@ sub request {
     if (defined $cache_key and exists $args->{socket_cache}->{$cache_key}) {
         $soc = $args->{socket_cache}->{$cache_key};
     } else {
-        ($soc, my $error) = construct_socket(@$args{qw(host port connect_timeout)});
+        ($soc, my $error) = _construct_socket(@$args{qw(host port connect_timeout)});
         return {error => $error} if defined $error;
         $args->{socket_cache}->{$cache_key} = $soc if defined $cache_key;
         $args->{on_connect}->() if exists $args->{on_connect};
     }
 
-    my $r = build_http_message($args);
+    my $r = _build_http_message($args);
     my $total = length($r);
     my $left = $total;
 
@@ -263,8 +265,10 @@ sub request {
         $left -= $rc;
     }
 
-    my ($proto,$status,$body,$head,$error) = eval {
-        read_http_message(fileno($soc), $args->{read_timeout});
+    my ($proto,$status,$head,$body,$error);
+    eval {
+        ($proto,$status,$head,$body,$error) = _read_http_message(fileno($soc), $args->{read_timeout}, $args->{parse_chunked});
+        1;
     } or do {
         my $err = $@ || "zombie error";
         delete $args->{socket_cache}->{$cache_key} if defined $cache_key;
@@ -376,6 +380,7 @@ optional with default values listed below
     body            => "",
     socket_cache    => {}, # (undef to disable, or \my %your_socket_cache)
     on_connect      => undef, # (or sub { ... })
+    parse_chunked   => 0,
 
 To keep the implementation minimal, Hijk does not take full URL string as
 input. User who need to parse URL string could use L<URI> modules.
@@ -425,6 +430,16 @@ singleton that we maintain keyed on C<join($;, $$, $host, $port)>.
 Alternatively you can pass in C<socket_cache> hash of your own which
 we'll use as the cache. To completely disable the cache pass in
 C<undef>.
+
+We have experimental support for parsing chunked responses
+encoding. historically Hijk didn't support this at all and if you
+wanted to use it with e.g. nginx you had to add
+C<chunked_transfer_encoding off> to its config file. Because you may
+just want to do that instead of having Hijk do more work to parse this
+out with a more complex and experimental codepath you have to
+explicitly enable it with C<parse_chunked>. Otherwise Hijk will die
+when it encounters chunked responses. The C<parse_chunked> option may
+be turned on by default in the future.
 
 The return value is a HashRef representing a response. It contains the following
 key-value pairs.

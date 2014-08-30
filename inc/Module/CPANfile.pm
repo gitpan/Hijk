@@ -5,9 +5,9 @@ use warnings;
 use Cwd;
 use Carp ();
 use Module::CPANfile::Environment;
-use Module::CPANfile::Result;
+use Module::CPANfile::Requirement;
 
-our $VERSION = '1.0002';
+our $VERSION = '1.1000';
 
 sub new {
     my($class, $file) = @_;
@@ -38,42 +38,46 @@ sub parse {
     };
 
     my $env = Module::CPANfile::Environment->new($file);
-    $self->{result} = $env->parse($code) or die $@;
+    $env->parse($code) or die $@;
+
+    $self->{_mirrors} = $env->mirrors;
+    $self->{_prereqs} = $env->prereqs;
 }
 
 sub from_prereqs {
     my($proto, $prereqs) = @_;
 
     my $self = $proto->new;
-    $self->{result} = Module::CPANfile::Result->from_prereqs($prereqs);
+    $self->{_prereqs} = Module::CPANfile::Prereqs->from_cpan_meta($prereqs);
 
     $self;
 }
 
+sub mirrors {
+    my $self = shift;
+    $self->{_mirrors} || [];
+}
+
 sub features {
     my $self = shift;
-    map $self->feature($_), keys %{$self->{result}{features}};
+    map $self->feature($_), $self->{_prereqs}->identifiers;
 }
 
 sub feature {
     my($self, $identifier) = @_;
-
-    my $data = $self->{result}{features}{$identifier}
-      or Carp::croak("Unknown feature '$identifier'");
-
-    require CPAN::Meta::Feature;
-    CPAN::Meta::Feature->new($data->{identifier}, {
-        description => $data->{description},
-        prereqs => $data->{spec},
-    });
+    $self->{_prereqs}->feature($identifier);
 }
 
 sub prereq { shift->prereqs }
 
 sub prereqs {
     my $self = shift;
-    require CPAN::Meta::Prereqs;
-    CPAN::Meta::Prereqs->new($self->prereq_specs);
+    $self->{_prereqs}->as_cpan_meta;
+}
+
+sub merged_requirements {
+    my $self = shift;
+    $self->{_prereqs}->merged_requirements;
 }
 
 sub effective_prereqs {
@@ -92,7 +96,18 @@ sub prereqs_with {
 
 sub prereq_specs {
     my $self = shift;
-    $self->{result}{spec};
+    $self->prereqs->as_string_hash;
+}
+
+sub prereq_for_module {
+    my($self, $module) = @_;
+    $self->{_prereqs}->find($module);
+}
+
+sub options_for_module {
+    my($self, $module) = @_;
+    my $prereq = $self->prereq_for_module($module) or return;
+    $prereq->requirement->options;
 }
 
 sub merge_meta {
@@ -121,15 +136,30 @@ sub _dump {
 sub to_string {
     my($self, $include_empty) = @_;
 
-    my $prereqs = $self->{result}{spec};
+    my $mirrors = $self->mirrors;
+    my $prereqs = $self->prereq_specs;
 
     my $code = '';
-    $code .= $self->_dump_prereqs($self->{result}{spec}, $include_empty);
+    $code .= $self->_dump_mirrors($mirrors);
+    $code .= $self->_dump_prereqs($prereqs, $include_empty);
 
-    for my $feature (values %{$self->{result}{features}}) {
+    for my $feature ($self->features) {
         $code .= sprintf "feature %s, %s => sub {\n", _dump($feature->{identifier}), _dump($feature->{description});
         $code .= $self->_dump_prereqs($feature->{spec}, $include_empty, 4);
         $code .= "}\n\n";
+    }
+
+    $code =~ s/\n+$/\n/s;
+    $code;
+}
+
+sub _dump_mirrors {
+    my($self, $mirrors) = @_;
+
+    my $code = "";
+
+    for my $url (@$mirrors) {
+        $code .= "mirror '$url';\n";
     }
 
     $code =~ s/\n+$/\n/s;
@@ -171,4 +201,4 @@ sub _dump_prereqs {
 
 __END__
 
-#line 293
+#line 323
