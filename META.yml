@@ -1,5 +1,5 @@
 ---
-abstract: 'Fast & minimal raw HTTP client'
+abstract: 'Fast & minimal low-level HTTP client'
 author:
   - 'Kang-min Liu & Borislav Nikolov'
 build_requires:
@@ -27,5 +27,5 @@ no_index:
 resources:
   license: http://opensource.org/licenses/mit-license.php
   repository: https://github.com/gugod/Hijk
-version: 0.16
+version: 0.17
 x_module_name: Hijk
