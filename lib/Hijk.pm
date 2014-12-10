@@ -5,7 +5,7 @@ use POSIX qw(:errno_h);
 use Socket qw(PF_INET SOCK_STREAM pack_sockaddr_in inet_ntoa $CRLF SOL_SOCKET SO_ERROR);
 use Fcntl qw(F_GETFL F_SETFL O_NONBLOCK);
 
-our $VERSION = "0.17";
+our $VERSION = "0.18";
 
 sub Hijk::Error::CONNECT_TIMEOUT         () { 1 << 0 } # 1
 sub Hijk::Error::READ_TIMEOUT            () { 1 << 1 } # 2
@@ -18,24 +18,20 @@ sub Hijk::Error::RESPONSE_READ_ERROR     () { 1 << 5 } # 32
 sub Hijk::Error::RESPONSE_BAD_READ_VALUE () { 1 << 6 } # 64
 sub Hijk::Error::RESPONSE_ERROR          () { Hijk::Error::RESPONSE_READ_ERROR | Hijk::Error::RESPONSE_BAD_READ_VALUE } # 96
 
-sub _selectable_timeout {
-    my $t = shift;
-    return defined($t) && $t <=0 ? undef : $t;
-}
-
 sub _read_http_message {
-    my ($fd, $read_length, $read_timeout, $parse_chunked, $head_as_array) = @_;
-    $read_timeout = _selectable_timeout($read_timeout);
+    my ($fd, $read_length, $read_timeout, $parse_chunked, $head_as_array, $method) = @_;
+    $read_timeout = undef if defined($read_timeout) && $read_timeout <= 0;
+
     my ($body,$buf,$decapitated,$nbytes,$proto);
     my $status_code = 0;
     my $header = $head_as_array ? [] : {};
     my $no_content_len = 0;
     my $head = "";
+    my $method_is_head = do { no warnings qw(uninitialized); $method eq "HEAD" };
     vec(my $rin = '', $fd, 1) = 1;
     do {
-        my $nfound = select($rin, undef, undef, $read_timeout);
         return (undef,undef,0,undef,undef, Hijk::Error::READ_TIMEOUT)
-            if ($nfound != 1 || (defined($read_timeout) && $read_timeout <= 0));
+            if ((select($rin, undef, undef, $read_timeout) != 1) || (defined($read_timeout) && $read_timeout <= 0));
 
         my $nbytes = POSIX::read($fd, $buf, $read_length);
         return ($proto, undef, $status_code, $header, $body)
@@ -127,8 +123,7 @@ sub _read_http_message {
                 }
             }
         }
-
-    } while( !$decapitated || $read_length > 0 || $no_content_len);
+    } while( !$decapitated || (!$method_is_head && ($read_length > 0 || $no_content_len)) );
     return (undef, $proto, $status_code, $header, $body);
 }
 
@@ -142,9 +137,8 @@ sub _read_chunked_body {
     while(1) {
         # just read a 10k block and process it until it is consumed
         if (length($buf) == 0 || length($buf) < $chunk_size) {
-            my $nfound = select($rin, undef, undef, $read_timeout);
             return (undef, Hijk::Error::READ_TIMEOUT)
-                if ($nfound != 1 || (defined($read_timeout) && $read_timeout <= 0));
+                if ((select($rin, undef, undef, $read_timeout) != 1) || (defined($read_timeout) && $read_timeout <= 0));
             my $current_buf = "";
             my $nbytes = POSIX::read($fd, $current_buf, $read_length);
             if (!defined($nbytes)) {
@@ -238,10 +232,9 @@ sub _construct_socket {
         die "Failed to connect $!";
     }
 
-    $connect_timeout = _selectable_timeout( $connect_timeout );
+    $connect_timeout = undef if defined($connect_timeout) && $connect_timeout <= 0;
     vec(my $rout = '', fileno($soc), 1) = 1;
-    my $nfound = select(undef, $rout, undef, $connect_timeout);
-    if ($nfound != 1) {
+    if (select(undef, $rout, undef, $connect_timeout) != 1) {
         if (defined($connect_timeout)) {
             return (undef, {error => Hijk::Error::CONNECT_TIMEOUT});
         } else {
@@ -318,9 +311,7 @@ sub request {
 
     vec(my $rout = '', fileno($soc), 1) = 1;
     while ($left > 0) {
-        my $nfound = select(undef, $rout, undef, undef);
-
-        if ($nfound != 1) {
+        if (select(undef, $rout, undef, undef) != 1) {
             delete $args->{socket_cache}->{$cache_key} if defined $cache_key;
             return {
                 error         => Hijk::Error::REQUEST_SELECT_ERROR,
@@ -348,7 +339,7 @@ sub request {
     my ($proto,$close_connection,$status,$head,$body,$error,$error_message,$errno_number,$errno_string);
     eval {
         ($close_connection,$proto,$status,$head,$body,$error,$error_message,$errno_number,$errno_string) =
-        _read_http_message(fileno($soc), @$args{qw(read_length read_timeout parse_chunked head_as_array)});
+        _read_http_message(fileno($soc), @$args{qw(read_length read_timeout parse_chunked head_as_array method)});
         1;
     } or do {
         my $err = $@ || "zombie error";
